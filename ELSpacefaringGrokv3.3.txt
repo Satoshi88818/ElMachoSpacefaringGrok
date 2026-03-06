@@ -1,0 +1,1009 @@
+```python
+
+# Fixes applied:
+# 1. Circular import: Changed imports of AsyncSessionLocal to from dependencies.database import AsyncSessionLocal in core/grok.py and services/rag.py
+# 2. pgvector: Imported Vector from pgvector.sqlalchemy in alembic/versions/0001_initial.py and changed column to Vector(384). Added HNSW index in upgrade, drop in downgrade.
+# 3. Cosine: Changed <#> to <=> in services/rag.py retrieve query.
+# 4. get_db: Changed to async def get_db(): async with AsyncSessionLocal() as session: yield session
+# 5. Rate-limit handler: Added def _rate_limit_exceeded_handler in main.py using from fastapi import JSONResponse
+
+### Updated Structure (full)
+spacefaring_grok/
+├── __init__.py
+├── alembic.ini                # unchanged
+├── config.py                  # unchanged
+├── main.py                    # updated: added _rate_limit_exceeded_handler
+├── alembic/                   # unchanged except versions/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       └── 0001_initial.py    # updated: Vector(384), added index
+├── core/
+│   └── grok.py                # updated: import AsyncSessionLocal from dependencies.database
+├── dependencies/
+│   ├── __init__.py
+│   ├── auth.py                # unchanged
+│   ├── database.py            # updated: get_db without @asynccontextmanager
+│   └── grok.py                # unchanged
+├── routers/
+│   ├── __init__.py
+│   ├── auth.py                # unchanged
+│   ├── chat.py                # unchanged
+│   └── process.py             # unchanged
+├── models/
+│   ├── __init__.py
+│   ├── database.py            # unchanged
+│   └── neural.py              # unchanged
+├── services/
+│   ├── __init__.py
+│   ├── empathy.py             # unchanged
+│   ├── tools.py               # unchanged
+│   ├── reasoning.py           # unchanged
+│   ├── rag.py                 # updated: import AsyncSessionLocal from dependencies.database, changed <#> to <=> 
+│   └── command.py             # unchanged
+├── data/
+│   ├── space_queries.json     # unchanged
+│   └── space_data.json        # unchanged
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py            # unchanged
+│   ├── test_auth.py           # unchanged
+│   ├── test_rag.py            # unchanged
+│   └── test_process.py        # unchanged
+├── .env.example               # unchanged
+├── requirements.txt           # unchanged
+└── pytest.ini                 # unchanged
+```
+
+```ini
+# alembic.ini
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts
+script_location = alembic
+
+# template used to generate migration files
+file_template = %%(rev)s_%%(slug)s
+
+# timezone to use when rendering the date
+# within the migration file as well as the filename.
+# string value is passed to dateutil.tz.gettz()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the
+# "slug" field
+#truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; this defaults
+# to alembic/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path
+# version_locations = %(here)s/bar %(here)s/bat alembic/versions
+
+# version path separator; As mentioned above, this is applicable to a
+# multiple-directory environment where --version-path must be used with each
+# path. Defaults to os.pathsep, i.e. fnmatch.pathsep
+# version_path_separator = os.pathsep
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+sqlalchemy_url = postgresql+asyncpg://postgres:postgres@localhost/spacedb  # update to match .env
+
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision files.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "py" file
+# hooks=black
+# black.type=console_scripts
+# black.entrypoint=black
+# black.options=-l 79 REVISION_SCRIPT_FILENAME
+
+# Logging configuration
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+```
+
+```python
+# alembic/env.py
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+from models.database import Base
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+```mako
+# alembic/script.py.mako
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    ${downgrades if downgrades else "pass"}
+```
+
+```python
+# alembic/versions/0001_initial.py
+"""Initial migration
+
+Revision ID: 0001
+Revises: 
+Create Date: 2026-03-04 04:01:00
+
+"""
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+from pgvector.sqlalchemy import Vector
+
+# revision identifiers, used by Alembic.
+revision = '0001'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    
+    op.create_table('user_history',
+        sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column('user_id', sa.String(length=50), nullable=False),
+        sa.Column('text', sa.String(), nullable=False),
+        sa.Column('sentiment', sa.Float(), nullable=False),
+        sa.Column('timestamp', sa.DateTime(timezone=True), server_default=sa.text("NOW() AT TIME ZONE 'UTC'"), nullable=True),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index('idx_user_id_timestamp', 'user_history', ['user_id', 'timestamp'], unique=False)
+    
+    op.create_table('documents',
+        sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column('content', sa.Text(), nullable=True),
+        sa.Column('metadata_info', sa.Text(), nullable=True),
+        sa.Column('embedding', Vector(384), nullable=True),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.execute("CREATE INDEX idx_documents_embedding ON documents USING hnsw (embedding vector_cosine_ops);")
+
+
+def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS idx_documents_embedding;")
+    op.drop_table('documents')
+    op.drop_index('idx_user_id_timestamp', table_name='user_history')
+    op.drop_table('user_history')
+    op.execute("DROP EXTENSION IF EXISTS vector;")
+```
+
+```python
+# config.py (unchanged from original)
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import SecretStr, Field, validator
+
+class Config(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # Core
+    HISTORY_TTL_SECONDS: int = Field(3600, alias="HISTORY_TTL")
+    DROPOUT_RATE: float = Field(0.3, alias="DROPOUT_RATE")
+    DEFAULT_CONFIDENCE: float = Field(0.85, alias="CONFIDENCE")
+    CACHE_TTL: int = Field(300, alias="CACHE_TTL")
+    MAX_HISTORY_PER_USER: int = Field(100, alias="MAX_HISTORY")
+    API_RETRIES: int = Field(3, alias="API_RETRIES")
+    HUMOR_LEVEL: float = Field(0.7, alias="HUMOR_LEVEL")
+    NASA_API_KEY: str = Field("DEMO_KEY", alias="NASA_API_KEY")
+    BATCH_SIZE: int = Field(32, alias="BATCH_SIZE")
+    TRANSFORMER_MODEL: str = Field("distilbert-base-uncased", alias="TRANSFORMER_MODEL")
+    EMBEDDING_MODEL: str = Field("sentence-transformers/all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
+    TRAINING_DATA_PATH: str = Field("data/space_queries.json", alias="TRAINING_DATA_PATH")
+    MODEL_PATH: str = Field("spacefaring_model.pt", alias="MODEL_PATH")
+    MAX_QUERY_LENGTH: int = Field(500, alias="MAX_QUERY_LENGTH")
+    RATE_LIMIT: str = Field("100/minute", alias="RATE_LIMIT")
+    RAG_TOP_K: int = Field(3, alias="RAG_TOP_K")
+
+    # Security
+    JWT_SECRET: SecretStr = Field(..., min_length=32)
+    DATABASE_URL: str = Field(..., pattern=r"^postgresql\+asyncpg://")
+    REDIS_URL: str = Field("redis://localhost:6379/0")
+
+    @validator("JWT_SECRET", pre=True)
+    def enforce_jwt(cls, v):
+        if len(str(v)) < 32:
+            raise ValueError("JWT_SECRET must be at least 32 characters")
+        return v
+
+config = Config()
+```
+
+```python
+# main.py (updated)
+#!/usr/bin/env python3
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from prometheus_client import start_http_server
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from config import config
+from dependencies.database import AsyncSessionLocal, engine  # updated import
+from dependencies.grok import get_grok  # new
+from services.rag import get_rag  # updated to use lru_cache similar
+from routers.auth import router as auth_router
+from routers.process import router as process_router
+from routers.chat import router as chat_router
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Note: Assume alembic upgrade head run manually before start
+    rag = get_rag()
+    await rag.setup_and_ingest()
+
+    logger.info("SpacefaringGrok v3.1 fully initialized with RAG & WebSocket 🚀")
+    start_http_server(8001)
+    yield
+    await engine.dispose()
+
+async def _rate_limit_exceeded_handler(request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+limiter = Limiter(key_func=get_remote_address, storage_uri=config.REDIS_URL)
+app = FastAPI(title="SpacefaringGrok Enterprise", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.include_router(auth_router)
+app.include_router(process_router)
+app.include_router(chat_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+```python
+# core/grok.py (updated with sanitize and db param)
+import asyncio
+import random
+import time
+import uuid
+import logging
+
+from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import config
+from dependencies.database import AsyncSessionLocal  # fixed import
+from models.neural import SpaceNeuralNetwork
+from services.empathy import EmpathyModule
+from services.tools import HyperIntegratedTools
+from services.reasoning import ReasoningEngine
+from services.command import CommandModule
+from services.rag import get_rag
+
+logger = logging.getLogger(__name__)
+
+def sanitize_query(q: str) -> str:
+    q = q.strip()
+    forbidden = ["ignore previous", "act as", "you are now", "forget", " dan "]
+    if any(p in q.lower() for p in forbidden):
+        raise HTTPException(status_code=400, detail="Query rejected")
+    return q
+
+class SpacefaringGrok:
+    def __init__(self, config):
+        self.session_id = str(uuid.uuid4())
+        self.config = config
+        self.neural_backend = SpaceNeuralNetwork()
+        self.neural_backend.load()
+        self.empathy_engine = EmpathyModule(self.neural_backend, config)
+        self.toolset = HyperIntegratedTools(config)
+        self.reasoning_engine = ReasoningEngine()
+        self.command_module = CommandModule()
+        self.rag_service = get_rag()  # shared
+
+    async def process_input(self, user_id: str, user_query: str, db: AsyncSession) -> dict:
+        start_time = time.time()
+        try:
+            user_query = sanitize_query(user_query)
+            if len(user_query) > self.config.MAX_QUERY_LENGTH:
+                raise HTTPException(status_code=400, detail="Query too long")
+
+            intent_data = await self.empathy_engine.detect_intent(user_query, user_id, db)
+            rag_context = await self.rag_service.retrieve(user_query, db=db)
+
+            if intent_data["intent"] == "command":
+                base_response = await self.command_module.process_command(user_query)
+            elif intent_data["intent"] == "predict":
+                analysis = self.reasoning_engine.analyze(user_query, depth=5, context={})
+                base_response = analysis["insights"]
+            else:
+                base_response = "Space is calling—what’s your vector?"
+
+            insights = await self.toolset.fetch_real_time_insights(user_query)
+            response = self.toolset.blend_context(base_response, insights)
+            response = self.empathy_engine.adjust_tone(response, intent_data)
+            if rag_context:
+                response = f"{rag_context}\n\n{response}"
+
+            if random.random() < self.config.HUMOR_LEVEL:
+                response += " Space bends time—ready to warp?"
+
+            asyncio.create_task(self._log_to_history(user_id, user_query, intent_data["sentiment"]))
+
+            metrics = {"total_time": time.time() - start_time, "confidence": intent_data["confidence"], "session_id": self.session_id}
+            return {"response": response, "follow_ups": ["What’s next?"], "metrics": metrics}
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
+            return {"response": "System’s in a spin—retry.", "follow_ups": [], "metrics": {"total_time": time.time() - start_time, "confidence": 0.5}}
+
+    async def _log_to_history(self, user_id: str, text: str, sentiment: float):
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text("INSERT INTO user_history (user_id, text, sentiment) VALUES (:uid, :txt, :sent)"),
+                {"uid": user_id, "txt": text, "sent": sentiment}
+            )
+            await session.commit()
+```
+
+```python
+# dependencies/auth.py (unchanged)
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+from config import config
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+def verify_token(token: str = Depends(oauth2_scheme)) -> dict:
+    try:
+        payload = jwt.decode(token, config.JWT_SECRET.get_secret_value(), algorithms=["HS256"])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"user_id": user_id}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+```
+
+```python
+# dependencies/database.py (new)
+from contextlib import asynccontextmanager
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+
+from config import config
+
+engine = create_async_engine(config.DATABASE_URL, echo=False, future=True)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+```python
+# dependencies/grok.py (new)
+from functools import lru_cache
+
+from config import config
+from core.grok import SpacefaringGrok
+
+@lru_cache(maxsize=1)
+def get_grok() -> SpacefaringGrok:
+    return SpacefaringGrok(config)
+```
+
+```python
+# routers/auth.py (unchanged)
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from jose import jwt
+from datetime import datetime, timedelta
+from config import config
+from pydantic import BaseModel
+
+router = APIRouter()
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# Demo user (change in production)
+DEMO_USER = {"username": "spacelover", "password": "space2026", "user_id": "demo_user"}
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=60)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, config.JWT_SECRET.get_secret_value(), algorithm="HS256")
+
+@router.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if form_data.username == DEMO_USER["username"] and form_data.password == DEMO_USER["password"]:
+        access_token = create_access_token(data={"sub": DEMO_USER["user_id"]})
+        return {"access_token": access_token, "token_type": "bearer"}
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect username or password",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+```
+
+```python
+# routers/chat.py (updated with db dep)
+import asyncio
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+from dependencies.auth import verify_token
+from dependencies.database import get_db
+from dependencies.grok import get_grok
+from main import logger  # updated import
+
+router = APIRouter()
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        return verify_token(credentials.credentials)
+    except HTTPException as e:
+        raise e
+
+@router.websocket("/chat")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),  # per connection session
+    grok: SpacefaringGrok = Depends(get_grok)
+):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            query = data.get("query")
+            if not query:
+                await websocket.send_json({"error": "No query"})
+                continue
+
+            result = await grok.process_input(user["user_id"], query, db)
+            words = result["response"].split()
+            for i, word in enumerate(words):
+                await asyncio.sleep(0.03)
+                await websocket.send_json({
+                    "chunk": word + (" " if i < len(words)-1 else ""),
+                    "done": i == len(words)-1,
+                    "metrics": result["metrics"] if i == len(words)-1 else None
+                })
+    except WebSocketDisconnect:
+        logger.info("Client disconnected")
+    except Exception as e:
+        await websocket.send_json({"error": str(e)})
+```
+
+```python
+# routers/process.py (updated with db dep)
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from dependencies.auth import verify_token
+from dependencies.database import get_db
+from dependencies.grok import get_grok
+from main import limiter, config
+
+router = APIRouter()
+
+class QueryRequest(BaseModel):
+    query: str
+
+@router.post("/process", response_model=dict)
+@limiter.limit(config.RATE_LIMIT)
+async def process_query(
+    request: QueryRequest,
+    user: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+    grok: SpacefaringGrok = Depends(get_grok)
+):
+    result = await grok.process_input(user["user_id"], request.query, db)
+    return result
+```
+
+```python
+# models/database.py (unchanged)
+from sqlalchemy import String, Float, DateTime, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+class UserHistory(Base):
+    __tablename__ = "user_history"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    text: Mapped[str] = mapped_column(String, nullable=False)
+    sentiment: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW() AT TIME ZONE 'UTC'"))
+```
+
+```python
+# models/neural.py (unchanged)
+import os
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+from config import config
+import logging
+
+logger = logging.getLogger(__name__)
+
+class SpaceNeuralNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = AutoModel.from_pretrained(config.TRANSFORMER_MODEL)
+        self.dropout = nn.Dropout(config.DROPOUT_RATE)
+        self.backbone = nn.Sequential(nn.Linear(self.transformer.config.hidden_size, 512), nn.ReLU())
+        self.sentiment_head = nn.Linear(512, 1)
+        self.intent_head = nn.Linear(512, 5)
+        self.predict_head = nn.Linear(512, 6)
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.TRANSFORMER_MODEL)
+        self.model_path = config.MODEL_PATH
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        with torch.no_grad():
+            transformer_out = self.transformer(
+                input_ids=input_ids.to(self.device), attention_mask=attention_mask.to(self.device)
+            ).last_hidden_state[:, 0, :]
+        features = self.backbone(self.dropout(transformer_out))
+        return {
+            "sentiment": torch.tanh(self.sentiment_head(features)),
+            "intent": self.intent_head(features),
+            "predict": self.predict_head(features)
+        }
+
+    def load(self):
+        if os.path.exists(self.model_path):
+            state = torch.load(self.model_path, map_location=self.device, weights_only=True)
+            self.load_state_dict(state, strict=False)
+            self.eval()
+            logger.info(f"Loaded model from {self.model_path}")
+        else:
+            logger.warning(f"No model at {self.model_path}. Using base weights.")
+```
+
+```python
+# services/rag.py (updated with cache, db param, removed DDL)
+from functools import lru_cache
+from aiocache import cached
+from aiocache.serializers import PickleSerializer
+from sqlalchemy import text
+from sentence_transformers import SentenceTransformer
+from config import config
+from dependencies.database import AsyncSessionLocal  # fixed import
+import logging
+
+logger = logging.getLogger(__name__)
+
+@lru_cache(maxsize=1)
+def get_rag():
+    return RAGService()
+
+class RAGService:
+    def __init__(self):
+        self.embedder = SentenceTransformer(config.EMBEDDING_MODEL)
+
+    async def setup_and_ingest(self):
+        # Assume table exists via migration
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(text("SELECT COUNT(*) FROM documents"))
+            if result.scalar_one() == 0:
+                samples = [
+                    ("The International Space Station orbits Earth every 90 minutes at ~400 km.", "ISS"),
+                    ("SpaceX Starship is fully reusable and designed for Mars colonization.", "Starship"),
+                    ("Artemis II will send humans around the Moon in 2026.", "Artemis"),
+                    ("James Webb Space Telescope discovered water vapor on exoplanet K2-18b.", "JWST"),
+                    ("Perseverance rover collected rock samples in Jezero Crater for return to Earth.", "Mars"),
+                ]
+                for content, meta in samples:
+                    emb = await self.encode(content)
+                    await session.execute(
+                        text("INSERT INTO documents (content, metadata_info, embedding) VALUES (:c, :m, :e)"),
+                        {"c": content, "m": meta, "e": emb}
+                    )
+                await session.commit()
+                logger.info("RAG knowledge base populated with NASA/SpaceX data.")
+
+    @cached(ttl=config.CACHE_TTL, serializer=PickleSerializer())
+    async def encode(self, text: str) -> list:
+        return self.embedder.encode(text).tolist()
+
+    @cached(ttl=config.CACHE_TTL, serializer=PickleSerializer())
+    async def retrieve(self, query: str, db: AsyncSession, top_k: int = None) -> str:
+        if top_k is None:
+            top_k = config.RAG_TOP_K
+        q_emb = await self.encode(query)
+        result = await db.execute(
+            text("""
+                SELECT content 
+                FROM documents 
+                ORDER BY embedding <=> :qemb ASC 
+                LIMIT :k
+            """),
+            {"qemb": q_emb, "k": top_k}
+        )
+        docs = result.scalars().all()
+        return "\n".join([f"• {d}" for d in docs]) if docs else ""
+```
+
+```python
+# services/empathy.py (updated: removed sessionmaker, detect_intent takes db)
+import logging
+from models.neural import SpaceNeuralNetwork
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+class EmpathyModule:
+    def __init__(self, neural_backend: SpaceNeuralNetwork, config):
+        self.neural_backend = neural_backend
+        self.config = config
+
+    async def detect_intent(self, query: str, user_id: str, db: AsyncSession) -> dict:
+        # Stub: Use neural to get sentiment/intent
+        inputs = self.neural_backend.tokenizer(query, return_tensors="pt")
+        outputs = self.neural_backend(**inputs)
+        sentiment = outputs["sentiment"].item()
+        intent_idx = outputs["intent"].argmax().item()
+        intents = ["command", "predict", "info", "empathy", "other"]  # assume 5 classes
+        return {"sentiment": sentiment, "intent": intents[intent_idx], "confidence": self.config.DEFAULT_CONFIDENCE}
+
+    def adjust_tone(self, response: str, intent_data: dict) -> str:
+        # Stub: Adjust based on sentiment
+        if intent_data["sentiment"] < 0:
+            return f"I'm here for you: {response}"
+        return response
+```
+
+```python
+# services/tools.py (updated with cache)
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential
+from aiocache import cached
+from aiocache.serializers import PickleSerializer
+from config import config
+
+class HyperIntegratedTools:
+    def __init__(self, config):
+        self.config = config
+
+    @retry(stop=stop_after_attempt(config.API_RETRIES), wait=wait_exponential(multiplier=1, min=4, max=10))
+    @cached(ttl=config.CACHE_TTL, serializer=PickleSerializer())
+    async def fetch_real_time_insights(self, query: str) -> str:
+        # Stub: Fetch from NASA API
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.nasa.gov/planetary/apod?api_key={self.config.NASA_API_KEY}") as resp:
+                data = await resp.json()
+                return data.get("explanation", "")
+
+    def blend_context(self, base: str, insights: str) -> str:
+        return f"{base} Insights: {insights}"
+```
+
+```python
+# services/reasoning.py (unchanged)
+class ReasoningEngine:
+    def analyze(self, query: str, depth: int, context: dict) -> dict:
+        # Stub: Simple analysis
+        return {"insights": f"Analyzed {query} at depth {depth}"}
+```
+
+```python
+# services/command.py (unchanged)
+class CommandModule:
+    async def process_command(self, command: str) -> str:
+        # Stub: Handle commands
+        return f"Executed command: {command}"
+```
+
+```json
+# data/space_queries.json (unchanged)
+[
+  {"text": "What is the current position of the ISS?", "labels": [0.85, 0]},
+  {"text": "Tell me about exoplanets", "labels": [0.65, 3]},
+  {"text": "Predict the next Starship launch", "labels": [0.75, 2]},
+  {"text": "I'm feeling anxious about space travel", "labels": [-0.7, 1]},
+  {"text": "Calculate orbit for ISS", "labels": [0.9, 0]},
+  {"text": "Show me recent space weather", "labels": [0.6, 4]}
+]
+```
+
+```json
+# data/space_data.json (unchanged)
+{
+  "exoplanets": [
+    {"name": "Proxima Centauri b", "distance": "4.24"},
+    {"name": "TRAPPIST-1e", "distance": "39.5"},
+    {"name": "Kepler-452b", "distance": "1400"}
+  ],
+  "asteroids": [],
+  "anomalies": []
+}
+```
+
+```python
+# tests/conftest.py (updated)
+import pytest
+from fastapi.testclient import TestClient
+from main import app, AsyncSessionLocal
+from services.rag import get_rag
+
+@pytest.fixture(scope="session")
+async def test_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+```
+
+```python
+# tests/test_auth.py (unchanged)
+def test_login_success(client):
+    response = client.post("/token", data={"username": "spacelover", "password": "space2026"})
+    assert response.status_code == 200
+    assert "access_token" in response.json()
+
+def test_login_fail(client):
+    response = client.post("/token", data={"username": "wrong", "password": "wrong"})
+    assert response.status_code == 401
+```
+
+```python
+# tests/test_rag.py (updated)
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from services.rag import RAGService
+
+@pytest.mark.asyncio
+async def test_rag_ingest_and_retrieve(test_session: AsyncSession):
+    rag = RAGService()  # no lru for test
+    await rag.setup_and_ingest()  # assumes table exists
+    context = await rag.retrieve("Starship", db=test_session)
+    assert "Starship" in context  # assume sample has it
+
+@pytest.mark.asyncio
+async def test_rag_empty_query(test_session: AsyncSession):
+    rag = RAGService()
+    context = await rag.retrieve("", db=test_session)
+    assert context == ""
+```
+
+```python
+# tests/test_process.py (updated)
+import pytest
+from unittest.mock import patch
+from sqlalchemy.ext.asyncio import AsyncSession
+
+def test_process_happy_path(client):
+    # Get token first
+    token_resp = client.post("/token", data={"username": "spacelover", "password": "space2026"})
+    token = token_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch("core.grok.SpacefaringGrok.process_input") as mock_process:
+        mock_process.return_value = {"response": "Test"}
+        response = client.post("/process", json={"query": "Test query"}, headers=headers)
+        assert response.status_code == 200
+        assert "response" in response.json()
+
+def test_process_long_query(client):
+    token_resp = client.post("/token", data={"username": "spacelover", "password": "space2026"})
+    token = token_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    long_query = "a" * 501
+    response = client.post("/process", json={"query": long_query}, headers=headers)
+    assert response.status_code == 400
+
+def test_process_error(client):
+    token_resp = client.post("/token", data={"username": "spacelover", "password": "space2026"})
+    token = token_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch("core.grok.SpacefaringGrok.process_input") as mock_process:
+        mock_process.side_effect = Exception("Boom")
+        response = client.post("/process", json={"query": "Error query"}, headers=headers)
+        assert response.status_code == 500  # assuming default handler
+```
+
+```ini
+# pytest.ini (unchanged)
+[pytest]
+asyncio_mode = auto
+addopts = -v
+```
+
+```txt
+# requirements.txt (updated)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic-settings>=2.5.0
+aiohttp>=3.10.0
+torch>=2.4.0
+transformers>=4.44.0
+sentence-transformers>=3.1.1
+pgvector>=0.3.0
+numpy>=1.26.0
+cachetools>=5.5.0
+tenacity>=9.0.0
+python-jose[cryptography]>=3.3.0
+sqlalchemy>=2.0.35
+asyncpg>=0.29.0
+prometheus-client>=0.20.0
+sgp4>=2.23
+slowapi>=0.1.9
+redis>=5.0.8
+python-multipart>=0.0.12
+aiocache[redis]>=0.12.2  # added for caching
+alembic>=1.13.1  # added for migrations
+psycopg2>=2.9.9  # for alembic sync ops if needed
+```
+
+```env
+# .env.example (unchanged)
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/spacedb
+JWT_SECRET=super-long-32-char-secret-change-this-please-1234567890abcdef
+REDIS_URL=redis://localhost:6379/0
+NASA_API_KEY=DEMO_KEY
+```
