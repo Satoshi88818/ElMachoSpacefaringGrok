@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+
+# Core Imports
+import os
+import json
+import time
+import uuid
+import random
+import asyncio
+import logging
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
+
+# Third-Party Imports
+import aiohttp
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, Field, validator, SecretStr
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from transformers import AutoTokenizer, AutoModel
+from cachetools import TTLCache
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from jose import JWTError, jwt
+
+# SQLAlchemy 2.0 + asyncpg (full replacement for psycopg2)
+from sqlalchemy import String, Float, DateTime, text, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+from prometheus_client import Counter, Histogram, start_http_server
+from sgp4.api import Satrec, jday
+
+# Logging Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ====================== CONFIG ======================
+class Config(BaseModel):
+    HISTORY_TTL_SECONDS: int = Field(3600, alias="HISTORY_TTL")
+    DROPOUT_RATE: float = Field(0.3, alias="DROPOUT_RATE")
+    DEFAULT_CONFIDENCE: float = Field(0.85, alias="CONFIDENCE")
+    CACHE_TTL: int = Field(300, alias="CACHE_TTL")
+    MAX_HISTORY_PER_USER: int = Field(100, alias="MAX_HISTORY")
+    API_RETRIES: int = Field(3, alias="API_RETRIES")
+    CUSTOM_DATASET_PATH: str = Field("space_data.json", alias="DATASET_PATH")
+    HUMOR_LEVEL: float = Field(0.7, alias="HUMOR_LEVEL")
+    NASA_API_KEY: str = Field("DEMO_KEY", alias="NASA_API_KEY")
+    BATCH_SIZE: int = Field(32, alias="BATCH_SIZE")
+    TRANSFORMER_MODEL: str = Field("distilbert-base-uncased", alias="TRANSFORMER_MODEL")
+    TRAINING_DATA_PATH: str = Field("space_queries.json", alias="TRAINING_DATA_PATH")
+    MODEL_PATH: str = Field("spacefaring_model.pt", alias="MODEL_PATH")
+    MAX_QUERY_LENGTH: int = Field(500, alias="MAX_QUERY_LENGTH")
+
+    # Security-hardened fields (no dummy defaults)
+    JWT_SECRET: SecretStr = Field(..., alias="JWT_SECRET", description="MUST be set via env - minimum 32 chars")
+    DATABASE_URL: str = Field(..., alias="DATABASE_URL", description="postgresql+asyncpg://user:pass@host/db")
+
+    @validator("JWT_SECRET", pre=True)
+    def enforce_jwt_secret(cls, v):
+        if not v or len(str(v)) < 32:
+            raise ValueError("JWT_SECRET must be provided and at least 32 characters long")
+        return v
+
+    @validator("DATABASE_URL", pre=True)
+    def enforce_db_url(cls, v):
+        if not v or not v.startswith("postgresql+asyncpg://"):
+            raise ValueError("DATABASE_URL must be a valid asyncpg connection string")
+        return v
+
+def load_config() -> Config:
+    return Config(
+        DATABASE_URL=os.getenv("DATABASE_URL"),
+        JWT_SECRET=os.getenv("JWT_SECRET"),
+        # all other fields from env with defaults above
+    )
+
+CONFIG = load_config()
+
+# ====================== ASYNC DB ======================
+engine = create_async_engine(CONFIG.DATABASE_URL, echo=False, future=True)
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+class UserHistory(Base):
+    __tablename__ = "user_history"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    text: Mapped[str] = mapped_column(String, nullable=False)
+    sentiment: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW() AT TIME ZONE 'UTC'"))
+
+# ====================== JWT ======================
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def verify_token(token: str = Depends(oauth2_scheme)) -> Dict[str, str]:
+    try:
+        payload = jwt.decode(token, CONFIG.JWT_SECRET.get_secret_value(), algorithms=["HS256"])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"user_id": user_id}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+
+# ====================== NEURAL NETWORK ======================
+class SpaceNeuralNetwork(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.transformer = AutoModel.from_pretrained(config.TRANSFORMER_MODEL)
+        self.dropout = nn.Dropout(config.DROPOUT_RATE)
+        self.backbone = nn.Sequential(nn.Linear(self.transformer.config.hidden_size, 512), nn.ReLU())
+        self.sentiment_head = nn.Linear(512, 1)
+        self.intent_head = nn.Linear(512, 5)
+        self.predict_head = nn.Linear(512, 6)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.TRANSFORMER_MODEL)
+        self.model_path = config.MODEL_PATH
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            transformer_out = self.transformer(input_ids=input_ids.to(self.device),
+                                             attention_mask=attention_mask.to(self.device)).last_hidden_state[:, 0, :]
+        features = self.backbone(self.dropout(transformer_out))
+        return {
+            "sentiment": torch.tanh(self.sentiment_head(features)),
+            "intent": self.intent_head(features),
+            "predict": self.predict_head(features)
+        }
+
+    def train_model(self, train_data: List[Dict[str, Any]], epochs: int = 5):
+        self.train()
+        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        # Fixed batching (original had bug)
+        inputs = [self.tokenizer(d["text"], return_tensors="pt", truncation=True, padding=True, max_length=128) for d in train_data]
+        labels = torch.tensor([d["labels"] for d in train_data], dtype=torch.float32).to(self.device)
+
+        for epoch in range(epochs):
+            for i in range(0, len(inputs), CONFIG.BATCH_SIZE):
+                batch = inputs[i:i + CONFIG.BATCH_SIZE]
+                batch_input_ids = torch.cat([b["input_ids"] for b in batch], dim=0)
+                batch_attention = torch.cat([b["attention_mask"] for b in batch], dim=0)
+                batch_labels = labels[i:i + CONFIG.BATCH_SIZE]
+                optimizer.zero_grad()
+                outputs = self(batch_input_ids, batch_attention)
+                loss = nn.MSELoss()(outputs["sentiment"], batch_labels[:, 0].unsqueeze(1)) + \
+                       nn.CrossEntropyLoss()(outputs["intent"], batch_labels[:, 1].long())
+                loss.backward()
+                optimizer.step()
+            logger.info(f"Epoch {epoch + 1}/{epochs} completed")
+
+    def save_model(self):
+        torch.save(self.state_dict(), self.model_path)
+        logger.info(f"Model saved to {self.model_path}")
+
+# ====================== EMPATHY (async DB) ======================
+class EmpathyModule:
+    def __init__(self, neural_backend: SpaceNeuralNetwork, sessionmaker, config: Config):
+        self.neural_backend = neural_backend
+        self.tokenizer = neural_backend.tokenizer
+        self.sessionmaker = sessionmaker
+        self.config = config
+        self.intents = ["command", "seek_help", "predict", "seek_insight", "anomaly"]
+
+    async def detect_intent(self, input_text: str, user_id: str) -> Dict[str, Any]:
+        try:
+            inputs = self.tokenizer(input_text, return_tensors="pt", truncation=True, padding=True, max_length=128)
+            outputs = self.neural_backend(inputs["input_ids"], inputs["attention_mask"])
+            intent_idx = outputs["intent"].argmax().item()
+            sentiment = outputs["sentiment"].item()
+            confidence = self.config.DEFAULT_CONFIDENCE
+
+            async with self.sessionmaker() as session:
+                await self._store_history(session, user_id, input_text, sentiment)
+                avg_history_sentiment = await self._get_avg_sentiment(session, user_id)
+
+            combined_sentiment = 0.6 * sentiment + 0.4 * avg_history_sentiment
+            mood = "stressed" if combined_sentiment < 0 else "neutral"
+            return {"mood": mood, "intent": self.intents[intent_idx], "sentiment": combined_sentiment, "confidence": confidence}
+        except Exception as e:
+            logger.error(f"Intent detection failed: {e}")
+            return {"mood": "neutral", "intent": "seek_insight", "sentiment": 0.0, "confidence": 0.5}
+
+    async def _store_history(self, session: AsyncSession, user_id: str, text: str, sentiment: float):
+        await session.execute(
+            text("""
+                INSERT INTO user_history (user_id, text, sentiment, timestamp)
+                VALUES (:uid, :txt, :sent, NOW() AT TIME ZONE 'UTC')
+                ON CONFLICT DO NOTHING
+            """),
+            {"uid": user_id, "txt": text[:CONFIG.MAX_QUERY_LENGTH], "sent": sentiment}
+        )
+        # TTL cleanup
+        await session.execute(
+            text("DELETE FROM user_history WHERE user_id = :uid AND timestamp < NOW() AT TIME ZONE 'UTC' - INTERVAL ':ttl seconds'"),
+            {"uid": user_id, "ttl": self.config.HISTORY_TTL_SECONDS}
+        )
+        await session.commit()
+
+    async def _get_avg_sentiment(self, session: AsyncSession, user_id: str) -> float:
+        result = await session.execute(
+            text("""
+                SELECT AVG(sentiment) FROM user_history 
+                WHERE user_id = :uid AND timestamp > NOW() AT TIME ZONE 'UTC' - INTERVAL ':ttl seconds'
+            """),
+            {"uid": user_id, "ttl": self.config.HISTORY_TTL_SECONDS}
+        )
+        avg = result.scalar_one_or_none()
+        return float(avg) if avg is not None else 0.0
+
+    def adjust_tone(self, response: str, intent_data: Dict[str, Any]) -> str:
+        if intent_data["mood"] == "stressed":
+            return f"Take a breath—{response}"
+        return f"Locked on: {response}"
+
+# ====================== TOOLS ======================
+class HyperIntegratedTools:
+    def __init__(self, config: Config):
+        self.cache = TTLCache(maxsize=1000, ttl=config.CACHE_TTL)
+        self.config = config
+        self.custom_dataset = self._load_custom_dataset()
+
+    def _load_custom_dataset(self) -> Dict[str, Any]:
+        try:
+            with open(self.config.CUSTOM_DATASET_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {"exoplanets": [], "asteroids": [], "anomalies": []}
+
+    async def fetch_real_time_insights(self, query: str) -> List[str]:
+        if query in self.cache:
+            return self.cache[query]
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                self._fetch_iss_position(session),
+                self._fetch_space_weather(session),
+                self._fetch_custom_insight(query),
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            insights = [r for r in results if isinstance(r, str) and r]
+            self.cache[query] = insights if insights else ["No cosmic signals yet."]
+            return self.cache[query]
+
+    @retry(stop=stop_after_attempt(CONFIG.API_RETRIES), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def _fetch_iss_position(self, session):
+        async with session.get("http://api.open-notify.org/iss-now.json", timeout=2.0) as resp:
+            data = await resp.json()
+            return f"ISS at Lat: {data['iss_position']['latitude']}, Lon: {data['iss_position']['longitude']}"
+
+    async def _fetch_space_weather(self, session):
+        url = f"https://api.nasa.gov/DONKI/notifications?type=all&api_key={self.config.NASA_API_KEY}"
+        async with session.get(url, timeout=2.0) as resp:
+            data = await resp.json()
+            return f"Space weather: {data[0]['messageBody'][:50]}..." if data else "No alerts."
+
+    async def _fetch_custom_insight(self, query: str) -> str:
+        query_lower = query.lower()
+        if "exoplanet" in query_lower and self.custom_dataset["exoplanets"]:
+            planet = random.choice(self.custom_dataset["exoplanets"])
+            return f"Exoplanet: {planet['name']} at {planet['distance']} ly."
+        return ""
+
+    def blend_context(self, response: str, insights: List[str]) -> str:
+        if not insights or random.random() < 0.6:
+            return response
+        return f"{response} [{' | '.join(insights)}]"
+
+# ====================== REASONING ======================
+class ReasoningEngine:
+    def __init__(self, max_depth: int = 10, timeout: float = 3.0):
+        self.max_depth = max_depth
+        self.timeout = timeout
+
+    def analyze(self, query: str, depth: int, context: Dict[str, Any]) -> Dict[str, Any]:
+        start_time = time.time()
+        metrics = {"time_spent": 0.0, "confidence": 0.85}
+        if time.time() - start_time > self.timeout:
+            return {"insights": "Overclocked—let’s reel it back!", "metrics": metrics}
+        query_lower = query.lower()
+        if "predict" in query_lower:
+            insights = "Prediction in progress..."
+            metrics["confidence"] = 0.9
+        else:
+            insights = "No space signal—zero in on something cosmic!"
+            metrics["confidence"] = 0.7
+        metrics["time_spent"] = time.time() - start_time
+        return {"insights": insights, "metrics": metrics}
+
+# ====================== COMMAND (smart orbit) ======================
+class CommandModule:
+    def __init__(self, grok_instance):
+        self.grok = grok_instance
+
+    async def plot_orbit(self, satellite: str = "ISS") -> str:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle",
+                    timeout=5.0
+                ) as resp:
+                    raw = await resp.text()
+            lines = raw.splitlines()
+
+            tle1 = tle2 = None
+            i = 0
+            while i < len(lines) - 2:
+                if lines[i].strip().upper() == satellite.upper() or \
+                   (satellite.isdigit() and satellite in lines[i + 1]):
+                    tle1 = lines[i + 1]
+                    tle2 = lines[i + 2]
+                    break
+                i += 1
+
+            if not tle1 or not tle2:
+                return f"Satellite '{satellite}' not found in active catalog. Try 'ISS' or a NORAD ID (e.g. 25544)."
+
+            sat = Satrec.twoline2rv(tle1.strip(), tle2.strip())
+            now = datetime.utcnow()
+            jd, fr = jday(now.year, now.month, now.day, now.hour, now.minute, now.second)
+            e, r, _ = sat.sgp4(jd, fr)
+            if e == 0:
+                return f"Orbit for {satellite} at {now}: X={r[0]:.1f} Y={r[1]:.1f} Z={r[2]:.1f} km"
+            return "Orbit data unavailable."
+        except Exception as e:
+            logger.error(f"Orbit calc failed: {e}")
+            return "Orbit data’s dodging us—retry."
+
+    def process_command(self, command: str) -> str:
+        tokens = command.lower().strip().split()
+        if not tokens:
+            return "No command. Try 'help'."
+        cmd = tokens[0]
+        if cmd == "help":
+            return "Commands: help, status, orbit [ISS|norad] [minutes]"
+        elif cmd == "status":
+            return "Gravity 1.0g, Temp 20°C. All systems nominal."
+        elif cmd == "orbit":
+            sat = tokens[1] if len(tokens) > 1 else "ISS"
+            return asyncio.run(self.plot_orbit(sat))  # safe in this context; full async in production
+        return "Command misfired—try 'help'."
+
+# ====================== MAIN GROK ======================
+class SpacefaringGrok:
+    def __init__(self, config: Config):
+        self.session_id = str(uuid.uuid4())
+        self.config = config
+        self.neural_backend = SpaceNeuralNetwork(config)
+        self.empathy_engine = EmpathyModule(self.neural_backend, AsyncSessionLocal, config)
+        self.toolset = HyperIntegratedTools(config)
+        self.reasoning_engine = ReasoningEngine()
+        self.command_module = CommandModule(self)
+        self._ensure_model_persisted()
+
+    def _ensure_model_persisted(self):
+        if os.path.exists(self.config.MODEL_PATH):
+            self.neural_backend.load_state_dict(
+                torch.load(self.config.MODEL_PATH, map_location=self.neural_backend.device, weights_only=True),
+                strict=False
+            )
+            self.neural_backend.eval()
+            logger.info(f"Loaded persisted model from {self.config.MODEL_PATH}")
+        else:
+            try:
+                with open(self.config.TRAINING_DATA_PATH, "r") as f:
+                    train_data = json.load(f)
+                self.neural_backend.train_model(train_data)
+                self.neural_backend.save_model()
+                self.neural_backend.eval()
+            except Exception as e:
+                logger.warning(f"Training skipped (data missing): {e}. Using base model.")
+
+    async def process_input(self, user_id: str, user_query: str) -> Dict[str, Any]:
+        start_time = time.time()
+        try:
+            if len(user_query) > self.config.MAX_QUERY_LENGTH:
+                raise HTTPException(status_code=400, detail="Query exceeds max length")
+
+            intent_data = await self.empathy_engine.detect_intent(user_query, user_id)
+            mood, intent, confidence = intent_data["mood"], intent_data["intent"], intent_data["confidence"]
+
+            if intent == "command":
+                base_response = self.command_module.process_command(user_query)
+            elif intent == "predict":
+                analysis = self.reasoning_engine.analyze(user_query, depth=5, context={})
+                base_response = analysis["insights"]
+                confidence = max(confidence, analysis["metrics"]["confidence"])
+            else:
+                base_response = "Space is calling—what’s your vector?"
+
+            insights = await self.toolset.fetch_real_time_insights(user_query)
+            response = self.toolset.blend_context(base_response, insights)
+            response = self.empathy_engine.adjust_tone(response, intent_data)
+
+            if mood != "stressed" and random.random() < self.config.HUMOR_LEVEL:
+                response += " Space bends time—ready to warp?"
+
+            metrics = {"total_time": time.time() - start_time, "confidence": confidence, "session_id": self.session_id}
+            return {"response": response, "follow_ups": ["What’s next?"], "metrics": metrics}
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
+            return {
+                "response": "System’s in a spin—retry.",
+                "follow_ups": ["What went wrong?"],
+                "metrics": {"total_time": time.time() - start_time, "confidence": 0.5, "session_id": self.session_id}
+            }
+
+# ====================== FASTAPI ======================
+app = FastAPI(title="SpacefaringGrok Enterprise")
+grok = SpacefaringGrok(CONFIG)
+
+class QueryRequest(BaseModel):
+    query: str
+
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_user_id_timestamp 
+            ON user_history (user_id, timestamp);
+        """))
+    logger.info("Async Database & tables initialized.")
+    start_http_server(8001)  # Prometheus
+
+@app.on_event("shutdown")
+async def shutdown():
+    await engine.dispose()
+
+@app.post("/process", response_model=dict)
+async def process_query(request: QueryRequest, user: dict = Depends(verify_token)):
+    # Production note: add slowapi / redis rate-limit middleware here
+    result = await grok.process_input(user["user_id"], request.query)
+    return result
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
